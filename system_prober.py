@@ -43,36 +43,43 @@ class SystemProber:
         current_dev = {}
         
         for line in lspci.splitlines():
-            if not line.startswith('\t') and line.strip():
+            if not line.startswith('\t') and not line.startswith(' ') and line.strip():
                 if current_dev:
                     devices.append(current_dev)
                 
                 parts = line.split(': ', 1)
                 if len(parts) == 2:
+                    pci_id = parts[0].split(' ')[0]
+                    device_desc = parts[1]
+                    device_type = parts[0].split(': ')[0] if ': ' in parts[0] else ''
+                    
                     current_dev = {
-                        'pci': parts[0].split(' ')[0],
-                        'name': parts[1],
+                        'pci': pci_id,
+                        'name': device_desc,
                         'category': 'Other',
                         'driver': None,
                         'modules': []
                     }
-                    lower = line.lower()
-                    if 'vga' in lower or '3d' in lower or 'display' in lower:
+                    
+                    lower_line = line.lower()
+                    lower_type = device_type.lower()
+                    
+                    if 'vga compatible controller' in lower_line or '3d controller' in lower_line or 'display controller' in lower_line:
                         current_dev['category'] = 'GPU'
-                    elif 'network' in lower or 'ethernet' in lower:
-                        current_dev['category'] = 'Network'
-                    elif 'audio' in lower:
+                    elif 'audio device' in lower_line or 'audio controller' in lower_line or 'multimedia audio' in lower_line:
                         current_dev['category'] = 'Audio'
-                    elif 'bluetooth' in lower:
+                    elif 'network controller' in lower_line or 'ethernet controller' in lower_line or 'wireless' in lower_line:
+                        current_dev['category'] = 'Network'
+                    elif 'bluetooth' in lower_line:
                         current_dev['category'] = 'Bluetooth'
-                    elif 'usb' in lower or 'serial' in lower:
-                        current_dev['category'] = 'Other'
             else:
                 line = line.strip()
                 if line.startswith('Kernel driver in use:'):
-                    current_dev['driver'] = line.split(': ')[1]
+                    driver = line.split(':', 1)[1].strip()
+                    current_dev['driver'] = driver
                 elif line.startswith('Kernel modules:'):
-                    current_dev['modules'] = [m.strip() for m in line.split(': ')[1].split(',')]
+                    modules_str = line.split(':', 1)[1].strip()
+                    current_dev['modules'] = [m.strip() for m in modules_str.split(',')]
         
         if current_dev:
             devices.append(current_dev)
@@ -83,19 +90,31 @@ class SystemProber:
     def get_gpu_info() -> Dict[str, Any]:
         lspci = SystemProber.get_lspci()
         vendor = "Unknown"
+        gpu_model = ""
+        gpu_line = ""
 
         for line in lspci.splitlines():
             lower = line.lower()
-            if "vga compatible controller" in lower or "3d controller" in lower:
-                if "nvidia" in lower:
-                    vendor = "NVIDIA"
-                elif "amd" in lower or "advanced micro devices" in lower or "ati" in lower:
-                    vendor = "AMD"
-                elif "intel" in lower:
+            if ("vga compatible controller" in lower or 
+                "3d controller" in lower or 
+                "display controller" in lower):
+                gpu_line = line
+                
+                if "intel corporation" in lower or "[8086:" in lower:
                     vendor = "Intel"
+                elif "nvidia" in lower or "[10de:" in lower:
+                    vendor = "NVIDIA"
+                elif ("amd" in lower or "ati" in lower or 
+                      "advanced micro devices" in lower or "[1002:" in lower):
+                    vendor = "AMD"
+                
+                if ':' in line and ']' in line:
+                    parts = line.split(':', 1)
+                    if len(parts) > 1:
+                        gpu_model = parts[1].split('[')[0].strip()
                 break
 
-        return {"vendor": vendor, "raw": lspci}
+        return {"vendor": vendor, "model": gpu_model, "raw": lspci}
 
     @staticmethod
     def get_session_type() -> str:
@@ -110,20 +129,171 @@ class SystemProber:
 
     @staticmethod
     def is_hybrid_graphics() -> bool:
-        lspci = SystemProber.get_lspci().lower()
-        has_intel = "intel corporation" in lspci
-        has_nvidia = "nvidia corporation" in lspci
-        has_amd = "advanced micro devices" in lspci or "amd" in lspci
-        return has_intel and (has_nvidia or has_amd)
+        devices = SystemProber.get_hardware_devices()
+        gpus = [d for d in devices if d['category'] == 'GPU']
+        
+        if len(gpus) < 2:
+            return False
+        
+        vendors = set()
+        for gpu in gpus:
+            name_lower = gpu['name'].lower()
+            if 'nvidia' in name_lower:
+                vendors.add('nvidia')
+            elif 'intel' in name_lower:
+                vendors.add('intel')
+            elif 'amd' in name_lower or 'ati' in name_lower or 'radeon' in name_lower:
+                vendors.add('amd')
+        
+        return len(vendors) >= 2
+
+    @staticmethod
+    def get_kernel_info() -> Dict[str, str]:
+        code, out, err = SystemProber.run_command(["uname", "-r"])
+        kernel_version = out.strip() if code == 0 else "Unknown"
+        
+        kernel_flavor = "default"
+        if "-lts" in kernel_version:
+            kernel_flavor = "lts"
+        elif "-zen" in kernel_version:
+            kernel_flavor = "zen"
+        elif "-hardened" in kernel_version:
+            kernel_flavor = "hardened"
+        elif "-cachyos" in kernel_version:
+            kernel_flavor = "cachyos"
+        
+        return {
+            "version": kernel_version,
+            "flavor": kernel_flavor
+        }
+
+    @staticmethod
+    def get_system_info() -> Dict[str, Any]:
+        info = {}
+        
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if "model name" in line:
+                        info['cpu'] = line.split(':', 1)[1].strip()
+                        break
+        except:
+            info['cpu'] = "Unknown"
+        
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if "MemTotal" in line:
+                        kb = int(line.split()[1])
+                        gb = round(kb / 1024 / 1024, 1)
+                        info['memory'] = f"{gb} GB"
+                        break
+        except:
+            info['memory'] = "Unknown"
+        
+        try:
+            code, out, err = SystemProber.run_command(["hostnamectl", "hostname"])
+            info['hostname'] = out.strip() if code == 0 else "Unknown"
+        except:
+            info['hostname'] = "Unknown"
+        
+        try:
+            code, out, err = SystemProber.run_command(["hostnamectl"])
+            for line in out.splitlines():
+                if "Operating System:" in line:
+                    info['os'] = line.split(':', 1)[1].strip()
+                elif "Chassis:" in line:
+                    chassis = line.split(':', 1)[1].strip()
+                    info['chassis'] = chassis.split()[0] if chassis else "desktop"
+                elif "Hardware Vendor:" in line:
+                    info['vendor'] = line.split(':', 1)[1].strip()
+                elif "Hardware Model:" in line:
+                    info['model'] = line.split(':', 1)[1].strip()
+        except:
+            pass
+        
+        return info
 
     @staticmethod
     def has_secure_boot() -> bool:
+        paths = [
+            "/sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data",
+            "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+        ]
+        
+        for path in paths:
+            try:
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        data = f.read()
+                        if len(data) >= 5:
+                            return data[4] == 1
+                        elif len(data) >= 1:
+                            return data[0] == 1
+            except Exception as e:
+                debug_log(f"SecureBoot detection failed for {path}: {e}")
+                continue
+        
+        return False
+
+    @staticmethod
+    def get_system_info() -> Dict[str, Any]:
+        info = {}
+        
         try:
-            path = "/sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data"
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    data = f.read(1)
-                    return data == b"\x01"
-        except Exception as e:
-            debug_log(f"SecureBoot detection failed: {e}")
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if "model name" in line:
+                        info['cpu'] = line.split(':', 1)[1].strip()
+                        break
+        except:
+            info['cpu'] = "Unknown"
+        
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if "MemTotal" in line:
+                        kb = int(line.split()[1])
+                        gb = round(kb / 1024 / 1024, 1)
+                        info['memory'] = f"{gb} GB"
+                        break
+        except:
+            info['memory'] = "Unknown"
+        
+        try:
+            code, out, err = SystemProber.run_command(["hostnamectl", "hostname"])
+            info['hostname'] = out.strip() if code == 0 else "Unknown"
+        except:
+            info['hostname'] = "Unknown"
+        
+        try:
+            code, out, err = SystemProber.run_command(["hostnamectl"])
+            for line in out.splitlines():
+                if "Operating System:" in line:
+                    info['os'] = line.split(':', 1)[1].strip()
+                elif "Chassis:" in line:
+                    chassis = line.split(':', 1)[1].strip()
+                    info['chassis'] = chassis.split()[0] if chassis else "desktop"
+                elif "Hardware Vendor:" in line:
+                    info['vendor'] = line.split(':', 1)[1].strip()
+                elif "Hardware Model:" in line:
+                    info['model'] = line.split(':', 1)[1].strip()
+        except:
+            pass
+        
+        return info
+        
+        for path in paths:
+            try:
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        data = f.read()
+                        if len(data) >= 5:
+                            return data[4] == 1
+                        elif len(data) >= 1:
+                            return data[0] == 1
+            except Exception as e:
+                debug_log(f"SecureBoot detection failed for {path}: {e}")
+                continue
+        
         return False
